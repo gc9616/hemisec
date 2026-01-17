@@ -40,4 +40,30 @@ def segmentation_hand_mask(bw_img):
     :param bw_img: grayscale image
     """
 
+    smoothed = cv2.GaussianBlur(bw_img, (0, 0), 3.0)
+
+    _, threshold = cv2.threshold(smoothed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentWithStats(threshold, connectivity=8)
+
+    if num_labels > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        hand_mask = (labels == largest).astype(np.uint8) * 255
+    else:
+        hand_mask = threshold.copy()
+
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+        iterations=1
+    )
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1
+    )
+
+    dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
+    safe_mask = (dist > 6).astype(np.uint8) * 255
     
+    return hand_mask, safe_mask
