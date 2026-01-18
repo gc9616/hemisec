@@ -26,71 +26,622 @@ def read_image_grayscale(path):
     return gray
 
 
-def create_hand_segmentation_mask(gray):
+def preprocess_image(gray, highlight_strength=1.3, contrast_alpha=1.4, 
+                     shadow_strength=1.2, sharpen_strength=1.5, sharpen_sigma=0.8,
+                     denoise=True, denoise_strength='light'):
     """
-    A2) Hand segmentation mask (largest bright component).
+    Preprocess image BEFORE segmentation to improve hand detection.
     
-    Steps:
-    1. Blur + Otsu thresholding
-    2. Largest connected component
-    3. Morphological cleanup
-    4. Safe mask via distance transform (avoids boundary artifacts)
+    This applies enhancement filters to the raw grayscale image to:
+    1. Reduce noise that can confuse segmentation
+    2. Increase contrast between hand and background
+    3. Strengthen edges for better boundary detection
+    
+    Args:
+        gray: Raw grayscale image
+        highlight_strength: Tone down highlights (multiply bright areas, default 1.3)
+        contrast_alpha: Contrast enhancement (default 1.4)
+        shadow_strength: Strengthen shadows for better separation (default 1.2)
+        sharpen_strength: Sharpen to enhance edges (default 1.5)
+        sharpen_sigma: Sharpening blur sigma (default 0.8)
+        denoise: Whether to apply initial denoising (default True)
+        denoise_strength: Denoising strength (default 'light')
+    
+    Returns:
+        Preprocessed grayscale image (uint8)
     """
-    # Blur + Otsu
-    blur = cv2.GaussianBlur(gray, (0, 0), 3.0)
-    _, thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    preprocessed = gray.copy()
     
-    # Largest connected component
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thr, connectivity=8)
+    # Create a temporary full mask for preprocessing (before we have real mask)
+    full_mask = np.ones_like(gray, dtype=np.uint8) * 255
+    
+    # 1. Initial denoising to reduce noise
+    if denoise:
+        if denoise_strength == 'light':
+            preprocessed = cv2.bilateralFilter(preprocessed, 5, 50, 50)
+        elif denoise_strength == 'medium':
+            preprocessed = cv2.bilateralFilter(preprocessed, 5, 75, 75)
+        else:  # strong
+            preprocessed = cv2.bilateralFilter(preprocessed, 7, 100, 100)
+    
+    # 2. Enhance contrast (helps separate hand from background)
+    preprocessed = cv2.convertScaleAbs(preprocessed, alpha=contrast_alpha, beta=0)
+    
+    # 3. Strengthen highlights (tone down very bright areas)
+    img_float = preprocessed.astype(np.float32)
+    threshold = np.percentile(preprocessed, 75)
+    highlight_mask = (preprocessed >= threshold).astype(np.float32)
+    # For preprocessing, we want to REDUCE highlights (divide rather than multiply)
+    # to make the hand-background boundary more uniform
+    reduction_factor = 1.0 / highlight_strength if highlight_strength > 1.0 else 1.0
+    img_float = img_float * (1.0 - highlight_mask * (1.0 - reduction_factor))
+    preprocessed = np.clip(img_float, 0, 255).astype(np.uint8)
+    
+    # 4. Strengthen shadows (darken dark areas for better contrast)
+    img_float = preprocessed.astype(np.float32)
+    shadow_threshold = np.percentile(preprocessed, 25)
+    shadow_mask = (preprocessed <= shadow_threshold).astype(np.float32)
+    img_float = img_float - (shadow_threshold - img_float) * (shadow_strength - 1.0) * shadow_mask
+    preprocessed = np.clip(img_float, 0, 255).astype(np.uint8)
+    
+    # 5. Sharpen to enhance edges (helps gradient-based detection)
+    blurred = cv2.GaussianBlur(preprocessed, (0, 0), sharpen_sigma)
+    img_float = preprocessed.astype(np.float32)
+    blurred_float = blurred.astype(np.float32)
+    sharpened = img_float + (img_float - blurred_float) * sharpen_strength
+    preprocessed = np.clip(sharpened, 0, 255).astype(np.uint8)
+    
+    return preprocessed
+
+
+def create_hand_segmentation_mask_adaptive(gray, block_size=101, c_offset=-15,
+                                           morph_close_size=35, morph_open_size=9,
+                                           safe_distance=15, otsu_bias=0.75):
+    """
+    Hand segmentation using adaptive thresholding with border exclusion.
+    
+    More robust to uneven lighting than global Otsu thresholding.
+    Excludes regions connected to image borders (background detection).
+    
+    Args:
+        gray: Grayscale input image
+        block_size: Size of neighborhood for adaptive threshold (default 101, must be odd)
+        c_offset: Constant subtracted from mean (negative = more lenient, default -15)
+        morph_close_size: Morphological closing kernel size (default 35)
+        morph_open_size: Morphological opening kernel size (default 9)
+        safe_distance: Distance transform threshold for safe mask (default 15, larger to avoid edges)
+        otsu_bias: Bias for initial Otsu threshold (default 0.75)
+    
+    Returns:
+        hand_mask: Binary mask of hand region
+        safe_mask: Eroded mask to avoid boundary artifacts
+    """
+    h, w = gray.shape
+    
+    # 1. Blur to reduce noise
+    blur = cv2.GaussianBlur(gray, (5, 5), 1.5)
+    
+    # 2. Get Otsu mask
+    otsu_thresh, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, rough_mask = cv2.threshold(blur, int(otsu_thresh * otsu_bias), 255, cv2.THRESH_BINARY)
+    
+    # 3. CRITICAL: Exclude border-connected regions (background detection)
+    # Mark all pixels connected to image border as background
+    border_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    rough_mask_copy = rough_mask.copy()
+    
+    # Flood fill from all border pixels
+    for x in range(w):
+        if rough_mask_copy[0, x] == 255:
+            cv2.floodFill(rough_mask_copy, border_mask, (x, 0), 128)
+        if rough_mask_copy[h-1, x] == 255:
+            cv2.floodFill(rough_mask_copy, border_mask, (x, h-1), 128)
+    for y in range(h):
+        if rough_mask_copy[y, 0] == 255:
+            cv2.floodFill(rough_mask_copy, border_mask, (0, y), 128)
+        if rough_mask_copy[y, w-1] == 255:
+            cv2.floodFill(rough_mask_copy, border_mask, (w-1, y), 128)
+    
+    # Keep only non-border-connected regions
+    hand_mask = (rough_mask_copy == 255).astype(np.uint8) * 255
+    
+    # 4. If no interior regions found, fall back to largest component
+    if cv2.countNonZero(hand_mask) < h * w * 0.05:  # Less than 5% of image
+        # Fall back: use largest component from original mask
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(rough_mask, connectivity=8)
+        if num_labels > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            hand_mask = (labels == largest).astype(np.uint8) * 255
+    
+    # 5. Find largest connected component (in case multiple interior regions)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(hand_mask, connectivity=8)
     if num_labels > 1:
-        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        hand_mask = (labels == largest).astype(np.uint8) * 255
-    else:
-        hand_mask = thr.copy()
+        # Prefer component closest to center
+        center_y, center_x = h // 2, w // 2
+        best_label = 1
+        best_score = -1
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            cx, cy = centroids[i]
+            dist_to_center = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+            # Score: larger area and closer to center is better
+            score = area / (dist_to_center + 1)
+            if score > best_score:
+                best_score = score
+                best_label = i
+        
+        hand_mask = (labels == best_label).astype(np.uint8) * 255
     
-    # Morph cleanup
+    # 6. Morphological closing to fill small gaps (but not too aggressive)
     hand_mask = cv2.morphologyEx(
         hand_mask, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
-        iterations=1
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_close_size, morph_close_size)),
+        iterations=2
     )
+    
+    # 7. Fill interior holes
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    hand_mask_inv = cv2.bitwise_not(hand_mask)
+    
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if hand_mask_inv[seed[1], seed[0]] == 255:
+            cv2.floodFill(hand_mask_inv, flood_mask, seed, 128)
+    
+    interior_holes = (hand_mask_inv == 255).astype(np.uint8) * 255
+    hand_mask = cv2.bitwise_or(hand_mask, interior_holes)
+    
+    # 8. Opening to smooth edges
     hand_mask = cv2.morphologyEx(
         hand_mask, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_open_size, morph_open_size)),
         iterations=1
     )
     
-    # Safe mask via distance transform (key to avoid boundary artifacts)
-    # DIST_L2, maskSize 5, threshold > 6
+    # 9. Safe mask via distance transform (larger distance to avoid edge artifacts)
     dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
-    safe_mask = (dist > 6).astype(np.uint8) * 255
+    safe_mask = (dist > safe_distance).astype(np.uint8) * 255
+    
+    # 10. CRITICAL: Force safe mask to never touch image borders (prevents edge artifacts)
+    border_margin = 20  # pixels from image edge to exclude
+    safe_mask[:border_margin, :] = 0  # top
+    safe_mask[-border_margin:, :] = 0  # bottom
+    safe_mask[:, :border_margin] = 0  # left
+    safe_mask[:, -border_margin:] = 0  # right
     
     return hand_mask, safe_mask
 
 
-def illumination_correction(gray, safe_mask):
+def create_hand_segmentation_mask_hybrid(gray, otsu_bias=0.80, canny_low=30, canny_high=100,
+                                         morph_close_size=35, morph_open_size=9,
+                                         safe_distance=15):
+    """
+    Hybrid hand segmentation: Otsu with border exclusion and gap-filling.
+    
+    Uses Otsu with reduced strictness, excludes border-connected regions,
+    then morphological operations to fill gaps. Best for problematic palm positioning.
+    
+    Args:
+        gray: Grayscale input image
+        otsu_bias: Bias for Otsu threshold (< 1.0 = less strict, default 0.80)
+        canny_low: Canny low threshold (unused, kept for API compatibility)
+        canny_high: Canny high threshold (unused, kept for API compatibility)
+        morph_close_size: Morphological closing kernel size (default 35)
+        morph_open_size: Morphological opening kernel size (default 9)
+        safe_distance: Distance transform threshold for safe mask (default 15, larger for edge avoidance)
+    
+    Returns:
+        hand_mask: Binary mask of hand region
+        safe_mask: Eroded mask to avoid boundary artifacts
+    """
+    h, w = gray.shape
+    
+    # 1. Get Otsu mask with reduced strictness
+    blur = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    otsu_thresh, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adjusted_thresh = int(otsu_thresh * otsu_bias)
+    _, thr = cv2.threshold(blur, adjusted_thresh, 255, cv2.THRESH_BINARY)
+    
+    # 2. CRITICAL: Exclude border-connected regions (background detection)
+    border_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    thr_copy = thr.copy()
+    
+    for x in range(w):
+        if thr_copy[0, x] == 255:
+            cv2.floodFill(thr_copy, border_mask, (x, 0), 128)
+        if thr_copy[h-1, x] == 255:
+            cv2.floodFill(thr_copy, border_mask, (x, h-1), 128)
+    for y in range(h):
+        if thr_copy[y, 0] == 255:
+            cv2.floodFill(thr_copy, border_mask, (0, y), 128)
+        if thr_copy[y, w-1] == 255:
+            cv2.floodFill(thr_copy, border_mask, (w-1, y), 128)
+    
+    # Keep only non-border-connected regions
+    hand_mask = (thr_copy == 255).astype(np.uint8) * 255
+    
+    # 3. If no interior regions found, fall back to largest component
+    if cv2.countNonZero(hand_mask) < h * w * 0.05:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thr, connectivity=8)
+        if num_labels > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            hand_mask = (labels == largest).astype(np.uint8) * 255
+    
+    # 4. Find best connected component (center-biased)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(hand_mask, connectivity=8)
+    if num_labels > 1:
+        center_y, center_x = h // 2, w // 2
+        best_label = 1
+        best_score = -1
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            cx, cy = centroids[i]
+            dist_to_center = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+            score = area / (dist_to_center + 1)
+            if score > best_score:
+                best_score = score
+                best_label = i
+        
+        hand_mask = (labels == best_label).astype(np.uint8) * 255
+    
+    # 5. Morphological closing to fill gaps
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_close_size, morph_close_size)),
+        iterations=2
+    )
+    
+    # 6. Fill interior holes
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    hand_mask_inv = cv2.bitwise_not(hand_mask)
+    
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if hand_mask_inv[seed[1], seed[0]] == 255:
+            cv2.floodFill(hand_mask_inv, flood_mask, seed, 128)
+    
+    interior_holes = (hand_mask_inv == 255).astype(np.uint8) * 255
+    hand_mask = cv2.bitwise_or(hand_mask, interior_holes)
+    
+    # 7. Opening to remove small protrusions/noise
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_open_size, morph_open_size)),
+        iterations=1
+    )
+    
+    # 8. Safe mask via distance transform (larger distance for edge artifact avoidance)
+    dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
+    safe_mask = (dist > safe_distance).astype(np.uint8) * 255
+    
+    # 9. CRITICAL: Force safe mask to never touch image borders (prevents edge artifacts)
+    border_margin = 20  # pixels from image edge to exclude
+    safe_mask[:border_margin, :] = 0  # top
+    safe_mask[-border_margin:, :] = 0  # bottom
+    safe_mask[:, :border_margin] = 0  # left
+    safe_mask[:, -border_margin:] = 0  # right
+    
+    return hand_mask, safe_mask
+
+
+def create_hand_segmentation_mask_otsu(gray, blur_sigma=3.0, otsu_bias=0.85,
+                                       morph_close_size=35, morph_open_size=9,
+                                       safe_distance=15):
+    """
+    Hand segmentation mask using Otsu thresholding with border exclusion.
+    
+    Steps:
+    1. Blur + Otsu thresholding (with bias to reduce strictness)
+    2. Exclude border-connected regions (background detection)
+    3. Select best component (center-biased)
+    4. Morphological cleanup
+    5. Safe mask via distance transform (larger erosion for edge artifact avoidance)
+    
+    Args:
+        gray: Grayscale input image
+        blur_sigma: Gaussian blur sigma before thresholding (default 3.0)
+        otsu_bias: Multiplier for Otsu threshold (< 1.0 = less strict, default 0.85)
+        morph_close_size: Morphological closing kernel size (default 35)
+        morph_open_size: Morphological opening kernel size (default 9)
+        safe_distance: Distance transform threshold for safe mask (default 15, larger for edge avoidance)
+    
+    Returns:
+        hand_mask: Binary mask of hand region
+        safe_mask: Eroded mask to avoid boundary artifacts
+    """
+    h, w = gray.shape
+    
+    # Blur
+    blur = cv2.GaussianBlur(gray, (0, 0), blur_sigma)
+    
+    # Get Otsu threshold value, then apply bias
+    otsu_thresh, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adjusted_thresh = int(otsu_thresh * otsu_bias)
+    _, thr = cv2.threshold(blur, adjusted_thresh, 255, cv2.THRESH_BINARY)
+    
+    # CRITICAL: Exclude border-connected regions (background detection)
+    border_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    thr_copy = thr.copy()
+    
+    # Flood fill from all border pixels
+    for x in range(w):
+        if thr_copy[0, x] == 255:
+            cv2.floodFill(thr_copy, border_mask, (x, 0), 128)
+        if thr_copy[h-1, x] == 255:
+            cv2.floodFill(thr_copy, border_mask, (x, h-1), 128)
+    for y in range(h):
+        if thr_copy[y, 0] == 255:
+            cv2.floodFill(thr_copy, border_mask, (0, y), 128)
+        if thr_copy[y, w-1] == 255:
+            cv2.floodFill(thr_copy, border_mask, (w-1, y), 128)
+    
+    # Keep only non-border-connected regions
+    hand_mask = (thr_copy == 255).astype(np.uint8) * 255
+    
+    # If no interior regions found, fall back to largest component
+    if cv2.countNonZero(hand_mask) < h * w * 0.05:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thr, connectivity=8)
+        if num_labels > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            hand_mask = (labels == largest).astype(np.uint8) * 255
+    
+    # Find best connected component (center-biased)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(hand_mask, connectivity=8)
+    if num_labels > 1:
+        center_y, center_x = h // 2, w // 2
+        best_label = 1
+        best_score = -1
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            cx, cy = centroids[i]
+            dist_to_center = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+            score = area / (dist_to_center + 1)
+            if score > best_score:
+                best_score = score
+                best_label = i
+        
+        hand_mask = (labels == best_label).astype(np.uint8) * 255
+    
+    # Morph cleanup - close gaps
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_close_size, morph_close_size)),
+        iterations=2
+    )
+    
+    # Fill interior holes
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    hand_mask_inv = cv2.bitwise_not(hand_mask)
+    
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if hand_mask_inv[seed[1], seed[0]] == 255:
+            cv2.floodFill(hand_mask_inv, flood_mask, seed, 128)
+    
+    interior_holes = (hand_mask_inv == 255).astype(np.uint8) * 255
+    hand_mask = cv2.bitwise_or(hand_mask, interior_holes)
+    
+    # Remove small protrusions
+    hand_mask = cv2.morphologyEx(
+        hand_mask, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_open_size, morph_open_size)),
+        iterations=1
+    )
+    
+    # Safe mask via distance transform (larger distance for edge artifact avoidance)
+    dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
+    safe_mask = (dist > safe_distance).astype(np.uint8) * 255
+    
+    # CRITICAL: Force safe mask to never touch image borders (prevents edge artifacts)
+    border_margin = 20  # pixels from image edge to exclude
+    safe_mask[:border_margin, :] = 0  # top
+    safe_mask[-border_margin:, :] = 0  # bottom
+    safe_mask[:, :border_margin] = 0  # left
+    safe_mask[:, -border_margin:] = 0  # right
+    
+    return hand_mask, safe_mask
+
+
+def exclude_fingers(hand_mask, finger_width_threshold=60, min_palm_area_ratio=0.20):
+    """
+    Remove finger regions from hand mask to keep only palm area.
+    
+    Uses a combination of:
+    1. Convex hull to find the bounding shape
+    2. Convexity defects to identify finger valleys
+    3. Morphological erosion to shrink to palm core
+    
+    The kernel size automatically scales with image size for consistent results.
+    
+    Args:
+        hand_mask: Binary hand mask (uint8)
+        finger_width_threshold: Base width of fingers to remove (pixels, default 60)
+                               Will be scaled based on image size.
+        min_palm_area_ratio: Min ratio of palm area to original mask (default 0.20)
+    
+    Returns:
+        palm_mask: Hand mask with fingers removed
+    """
+    h, w = hand_mask.shape
+    original_area = cv2.countNonZero(hand_mask)
+    
+    if original_area == 0:
+        return hand_mask
+    
+    # Scale based on image size (assume 600px as baseline)
+    scale_factor = max(w, h) / 600.0
+    
+    # Method 1: Use large erosion to shrink to palm core, then dilate back
+    # Fingers are thin protrusions that get eroded away
+    erode_size = int(80 * scale_factor)  # More aggressive erosion
+    if erode_size % 2 == 0:
+        erode_size += 1
+    erode_size = max(31, min(401, erode_size))
+    
+    print(f"  Finger exclusion: image {w}x{h}, scale={scale_factor:.2f}, erode_size={erode_size}px")
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
+    
+    # Heavy erosion to get palm core
+    palm_core = cv2.erode(hand_mask, kernel, iterations=1)
+    
+    # Find the bounding rectangle of the palm core
+    contours, _ = cv2.findContours(palm_core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if len(contours) == 0:
+        # Fallback: use original mask
+        print(f"  Warning: Erosion removed everything, using original mask")
+        return hand_mask
+    
+    # Find largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Create convex hull of the palm core - this gives a smooth palm shape
+    hull = cv2.convexHull(largest_contour)
+    
+    # Create palm mask from convex hull
+    palm_mask = np.zeros_like(hand_mask)
+    cv2.drawContours(palm_mask, [hull], -1, 255, -1)
+    
+    # Intersect with original mask to keep only actual hand pixels
+    palm_mask = cv2.bitwise_and(palm_mask, hand_mask)
+    
+    # Small opening to smooth edges
+    small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    palm_mask = cv2.morphologyEx(palm_mask, cv2.MORPH_OPEN, small_kernel)
+    
+    # Find largest connected component
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(palm_mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        palm_mask = (labels == largest).astype(np.uint8) * 255
+    
+    # Verify we didn't remove too much
+    palm_area = cv2.countNonZero(palm_mask)
+    if palm_area < original_area * min_palm_area_ratio:
+        print(f"  Warning: Finger exclusion removed too much ({100*palm_area/original_area:.0f}% remaining), using original mask")
+        return hand_mask
+    
+    print(f"  Finger exclusion: kept {100*palm_area/original_area:.0f}% of original mask")
+    return palm_mask
+
+
+def create_hand_segmentation_mask(gray, method='hybrid', preprocess=True,
+                                  preprocess_contrast=1.4, preprocess_sharpen=1.5,
+                                  otsu_bias=0.85, canny_low=30, canny_high=100,
+                                  exclude_fingers_flag=True, finger_width=60):
+    """
+    Create hand segmentation mask using specified method.
+    
+    This is the main entry point for hand segmentation. It optionally preprocesses
+    the image first, then applies the chosen segmentation method.
+    
+    Available methods:
+    - 'hybrid': Combines Otsu + edge-based filling (RECOMMENDED - most robust)
+    - 'adaptive': Uses adaptive thresholding (good for uneven lighting)
+    - 'otsu': Uses Otsu thresholding with bias (faster, less robust)
+    
+    Args:
+        gray: Grayscale input image
+        method: 'hybrid' (default), 'adaptive', or 'otsu'
+        preprocess: Whether to preprocess image before segmentation (default True)
+        preprocess_contrast: Contrast alpha for preprocessing (default 1.4)
+        preprocess_sharpen: Sharpening strength for preprocessing (default 1.5)
+        otsu_bias: Bias for Otsu threshold (< 1.0 = less strict, default 0.85)
+        canny_low: Low threshold for Canny edge detection (default 30)
+        canny_high: High threshold for Canny edge detection (default 100)
+        exclude_fingers_flag: Whether to remove finger regions from mask (default True)
+        finger_width: Max finger width in pixels for exclusion (default 60)
+    
+    Returns:
+        hand_mask: Binary mask of hand region
+        safe_mask: Eroded mask to avoid boundary artifacts
+    """
+    # Optionally preprocess the image to improve segmentation
+    if preprocess:
+        gray_for_seg = preprocess_image(
+            gray, 
+            contrast_alpha=preprocess_contrast,
+            sharpen_strength=preprocess_sharpen,
+            denoise=True,
+            denoise_strength='light'
+        )
+    else:
+        gray_for_seg = gray
+    
+    # Apply chosen segmentation method
+    if method == 'hybrid':
+        hand_mask, safe_mask = create_hand_segmentation_mask_hybrid(
+            gray_for_seg,
+            otsu_bias=otsu_bias,
+            canny_low=canny_low,
+            canny_high=canny_high
+        )
+    elif method == 'adaptive':
+        hand_mask, safe_mask = create_hand_segmentation_mask_adaptive(gray_for_seg)
+    else:  # 'otsu'
+        hand_mask, safe_mask = create_hand_segmentation_mask_otsu(
+            gray_for_seg, 
+            otsu_bias=otsu_bias
+        )
+    
+    # Optionally exclude fingers from the mask
+    if exclude_fingers_flag:
+        hand_mask = exclude_fingers(hand_mask, finger_width_threshold=finger_width)
+        
+        # Recalculate safe mask after finger exclusion
+        h, w = gray.shape
+        dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
+        safe_mask = (dist > 15).astype(np.uint8) * 255
+        
+        # Apply border margin
+        border_margin = 20
+        safe_mask[:border_margin, :] = 0
+        safe_mask[-border_margin:, :] = 0
+        safe_mask[:, :border_margin] = 0
+        safe_mask[:, -border_margin:] = 0
+    
+    return hand_mask, safe_mask
+
+
+def illumination_correction(gray, safe_mask, clahe_clip=3.5, clahe_grid=6, bg_sigma=30.0):
     """
     A3) Illumination correction (veins dark → become bright).
     
     Parameters:
-    - background blur sigma = 35.0
-    - CLAHE: clipLimit = 2.0, tileGridSize = (8,8)
-    - post blur sigma = 1.2
+    - background blur sigma: controls how much background is smoothed (default 30.0)
+    - CLAHE: Contrast Limited Adaptive Histogram Equalization
+      - clipLimit: higher = more contrast, more sensitive to features (default 3.5)
+      - tileGridSize: smaller = more local contrast (default 6)
+    - post blur sigma = 1.0 (slightly sharper)
+    
+    Args:
+        gray: Input grayscale image
+        safe_mask: Safe mask for hand region
+        clahe_clip: CLAHE clip limit (higher = more sensitive, default 3.5)
+        clahe_grid: CLAHE tile grid size (smaller = more local, default 6)
+        bg_sigma: Background blur sigma (default 30.0)
+    
+    Returns:
+        hp: Illumination-corrected image with enhanced veins
     """
-    # Background blur
-    bg = cv2.GaussianBlur(gray, (0, 0), 35.0)
+    # Background blur (slightly less blur to preserve more detail)
+    bg = cv2.GaussianBlur(gray, (0, 0), bg_sigma)
     
     # High-pass: dark veins -> brighter
     hp = cv2.subtract(bg, gray)
     hp = cv2.bitwise_and(hp, hp, mask=safe_mask)
     hp = cv2.normalize(hp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # CLAHE with higher clip limit for more sensitivity
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(clahe_grid, clahe_grid))
     hp = clahe.apply(hp)
     
-    # Post blur
-    hp = cv2.GaussianBlur(hp, (0, 0), 1.2)
+    # Apply CLAHE again for even more enhancement
+    hp = clahe.apply(hp)
+    
+    # Slightly less blur to preserve sharp features
+    hp = cv2.GaussianBlur(hp, (0, 0), 1.0)
     
     return hp
 
@@ -430,30 +981,61 @@ def vessel_response_single_scale(hp, safe_mask, ksize=31, sig=5.0, lambd=10.0, g
 
 def vessel_response_multiscale(hp, safe_mask):
     """
-    B2) Multi-scale vessel response (captures thin + thick veins).
+    B2) Multi-scale vessel response - adapts to image resolution.
     
-    Runs two Gabor banks:
-    - Fine scale (thin vessels): ksize=31, sigma=5, lambda=10
-    - Coarse scale (thicker vessels): ksize=51, sigma=8, lambda=18
+    Scales Gabor kernel sizes based on image dimensions to handle both
+    high-res and low-res images appropriately.
     
-    Returns normalized and maxed response.
+    Returns normalized and thresholded response.
     """
-    # Fine scale (thin vessels)
-    resp_fine = gabor_bank(hp, 31, 5.0, 10.0, gamma=0.5, ntheta=12)
+    h, w = hp.shape[:2]
+    img_size = max(h, w)
     
-    # Coarse scale (thicker vessels)
-    resp_coarse = gabor_bank(hp, 51, 8.0, 18.0, gamma=0.7, ntheta=10)
+    # Scale factor: 1.0 for 600px, higher for larger images
+    scale = max(1.0, img_size / 600.0)
     
-    # Normalize each to [0,1] then max
-    rf_min, rf_max = resp_fine.min(), resp_fine.max()
-    rc_min, rc_max = resp_coarse.min(), resp_coarse.max()
+    # Base scales optimized for ~600px images
+    base_scales = [
+        # (base_ksize, base_sigma, base_lambda, gamma_val, ntheta)
+        (41, 7.0, 14.0, 0.5, 10),    # Medium vessels
+        (61, 11.0, 22.0, 0.6, 8),    # Thick vessels  
+        (81, 15.0, 30.0, 0.7, 6),    # Major veins
+    ]
     
-    rf = (resp_fine - rf_min) / (rf_max - rf_min + 1e-9)
-    rc = (resp_coarse - rc_min) / (rc_max - rc_min + 1e-9)
+    responses = []
+    for base_ksize, base_sigma, base_lambd, gamma_val, ntheta in base_scales:
+        # Scale up for larger images
+        ksize = int(base_ksize * scale)
+        ksize = ksize if ksize % 2 == 1 else ksize + 1  # Must be odd
+        sigma = base_sigma * scale
+        lambd = base_lambd * scale
+        
+        resp = gabor_bank(hp, ksize, sigma, lambd, gamma=gamma_val, ntheta=ntheta)
+        r_min, r_max = resp.min(), resp.max()
+        resp_norm = (resp - r_min) / (r_max - r_min + 1e-9)
+        responses.append(resp_norm)
     
-    resp = np.maximum(rf, rc)
+    # Max across scales
+    resp = responses[0]
+    for r in responses[1:]:
+        resp = np.maximum(resp, r)
     
-    # Convert to uint8
+    # Adaptive threshold: higher for larger/noisier images
+    threshold_pct = min(70, 50 + (scale - 1) * 10)
+    vals = resp[safe_mask > 0]
+    if len(vals) > 0:
+        threshold = np.percentile(vals, threshold_pct)
+        resp = np.where(resp > threshold, resp, 0)
+    
+    # Blur proportional to image size
+    blur_sigma = 2.0 * scale
+    resp = cv2.GaussianBlur(resp.astype(np.float32), (0, 0), blur_sigma)
+    
+    # Re-normalize
+    r_min, r_max = resp.min(), resp.max()
+    if r_max > r_min:
+        resp = (resp - r_min) / (r_max - r_min)
+    
     resp_u8 = (resp * 255).astype(np.uint8)
     resp_u8 = cv2.bitwise_and(resp_u8, resp_u8, mask=safe_mask)
     
@@ -534,7 +1116,14 @@ def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overla
                           denoise=True,
                           denoise_method='bilateral',
                           denoise_strength='medium',
-                          remove_small_noise=True):
+                          remove_small_noise=True,
+                          segmentation_method='gradient',
+                          preprocess_for_segmentation=True,
+                          otsu_bias=0.85,
+                          canny_low=30,
+                          canny_high=100,
+                          exclude_fingers=True,
+                          finger_width=60):
     """
     Complete pipeline: extract palm vein feature map.
     
@@ -554,6 +1143,11 @@ def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overla
         denoise_method: 'bilateral', 'median', 'nlm', or 'both' (default 'bilateral')
         denoise_strength: 'light', 'medium', or 'strong' (default 'medium')
         remove_small_noise: Whether to remove small noise blobs (default True)
+        segmentation_method: 'gradient' (edge-based) or 'otsu' (threshold-based)
+        preprocess_for_segmentation: Whether to preprocess image before segmentation
+        otsu_bias: Bias for Otsu threshold (< 1.0 = less strict, default 0.85)
+        canny_low: Low threshold for Canny edge detection (default 30)
+        canny_high: High threshold for Canny edge detection (default 100)
     
     Returns:
         enhanced: Final enhanced vessel feature map (uint8)
@@ -562,10 +1156,19 @@ def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overla
         overlay: Red overlay visualization (BGR) if create_overlay=True, else None
         hp_enhanced: Enhanced illumination-corrected image (if use_illumination_as_feature)
     """
-    # A2) Hand segmentation
-    hand_mask, safe_mask = create_hand_segmentation_mask(gray)
+    # A2) Hand segmentation (now with preprocessing and method selection)
+    hand_mask, safe_mask = create_hand_segmentation_mask(
+        gray, 
+        method=segmentation_method,
+        preprocess=preprocess_for_segmentation,
+        otsu_bias=otsu_bias,
+        canny_low=canny_low,
+        canny_high=canny_high,
+        exclude_fingers_flag=exclude_fingers,
+        finger_width=finger_width
+    )
     
-    # A3) Illumination correction
+    # A3) Illumination correction (with increased sensitivity)
     hp = illumination_correction(gray, safe_mask)
     
     # Option: Use enhanced illumination-corrected as final feature map
@@ -624,14 +1227,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage (single-scale, enhanced)
-  python palm_vein_feature_map.py input.jpg -o output_dir
+  # Basic usage (hybrid segmentation, default settings - RECOMMENDED)
+  python feature_map.py input.jpg -o output_dir
 
-  # Multi-scale with all outputs
-  python palm_vein_feature_map.py input.jpg -o output_dir --multiscale --all
+  # Best quality: illumination mode with strong enhancements
+  python feature_map.py input.jpg --use-illumination --highlight-strength 2.5 \\
+    --contrast-alpha 1.8 --shadow-strength 1.6 --sharpen-strength 2.2 \\
+    --sharpen-sigma 0.6 --denoise-method both --denoise-strength medium --all -o output_dir
 
-  # Single-scale, no enhancement, no overlay
-  python palm_vein_feature_map.py input.jpg -o output_dir --no-multiscale --no-enhance --no-overlay
+  # Adaptive segmentation (best for uneven lighting)
+  python feature_map.py input.jpg -o output_dir --segmentation adaptive
+
+  # Otsu segmentation with reduced strictness (faster, captures more)
+  python feature_map.py input.jpg -o output_dir --segmentation otsu --otsu-bias 0.75
+
+  # Multi-scale Gabor with all intermediate outputs
+  python feature_map.py input.jpg -o output_dir --multiscale --all
         """
     )
     parser.add_argument("input", type=Path, help="Input grayscale image path")
@@ -645,10 +1256,13 @@ Examples:
                        help="Apply robust normalization + gamma enhancement (default: True)")
     parser.add_argument("--no-enhance", dest="enhance", action="store_false",
                        help="Skip enhancement step")
-    parser.add_argument("--overlay", action="store_true", default=True,
-                       help="Create red overlay visualization (default: True)")
+
+    # CHANGE: default overlay OFF so we don't spam files
+    parser.add_argument("--overlay", action="store_true", default=False,
+                       help="Create red overlay visualization (default: False)")
     parser.add_argument("--no-overlay", dest="overlay", action="store_false",
                        help="Skip overlay creation")
+
     parser.add_argument("--all", action="store_true",
                        help="Save all intermediate outputs (hand_mask, hp, resp_u8, etc.)")
     parser.add_argument("--use-illumination", action="store_true", default=False,
@@ -676,6 +1290,21 @@ Examples:
     parser.add_argument("--no-remove-small-noise", dest="remove_small_noise", action="store_false", default=True,
                        help="Skip morphological noise removal")
     
+    # Segmentation options
+    parser.add_argument("--segmentation", type=str, default="hybrid",
+                       choices=["hybrid", "adaptive", "otsu"],
+                       help="Segmentation method: hybrid (Otsu+edges, RECOMMENDED), adaptive (for uneven lighting), or otsu (threshold-based, default: hybrid)")
+    parser.add_argument("--no-preprocess-seg", dest="preprocess_seg", action="store_false", default=True,
+                       help="Skip preprocessing before segmentation (not recommended)")
+    parser.add_argument("--otsu-bias", type=float, default=0.85,
+                       help="Otsu threshold bias (< 1.0 = less strict, captures more of hand, default: 0.85)")
+    parser.add_argument("--canny-low", type=int, default=30,
+                       help="Canny edge detection low threshold (default: 30)")
+    parser.add_argument("--canny-high", type=int, default=100,
+                       help="Canny edge detection high threshold (default: 100)")
+    parser.add_argument("--finger-width", type=int, default=60,
+                       help="Max finger width in pixels for exclusion (default: 60)")
+    
     args = parser.parse_args()
     
     # Validate input
@@ -693,8 +1322,8 @@ Examples:
     gray = read_image_grayscale(args.input)
     
     # Run pipeline
-    print("Running palm vein feature extraction pipeline...")
-    result = palm_vein_feature_map(
+    print(f"Running palm vein feature extraction pipeline (segmentation: {args.segmentation})...")
+    enhanced, resp_u8, safe_mask, overlay, hp_enhanced = palm_vein_feature_map(
         gray,
         use_multiscale=args.multiscale,
         enhance=args.enhance,
@@ -709,17 +1338,24 @@ Examples:
         denoise=args.denoise,
         denoise_method=args.denoise_method,
         denoise_strength=args.denoise_strength,
-        remove_small_noise=args.remove_small_noise
+        remove_small_noise=args.remove_small_noise,
+        segmentation_method=args.segmentation,
+        preprocess_for_segmentation=args.preprocess_seg,
+        otsu_bias=args.otsu_bias,
+        canny_low=args.canny_low,
+        canny_high=args.canny_high,
+        exclude_fingers=True,  # Always exclude fingers
+        finger_width=args.finger_width
     )
-    enhanced, resp_u8, safe_mask, overlay, hp_enhanced = result
     
     # Save outputs
     stem = args.input.stem
     
-    # Main outputs
-    cv2.imwrite(str(args.output / f"{stem}_enhanced_feature_map.png"), enhanced)
-    print(f"✓ Enhanced feature map: {args.output / f'{stem}_enhanced_feature_map.png'}")
-    
+    # MAIN OUTPUT (default): raw response map (most stable for downstream feature vectoring)
+    cv2.imwrite(str(args.output / f"{stem}_raw_response.png"), resp_u8)
+    print(f"✓ Raw response map: {args.output / f'{stem}_raw_response.png'}")
+
+    # Optional overlay
     if args.overlay and overlay is not None:
         cv2.imwrite(str(args.output / f"{stem}_overlay.png"), overlay)
         print(f"✓ Red overlay: {args.output / f'{stem}_overlay.png'}")
@@ -727,8 +1363,21 @@ Examples:
     # Save intermediates if requested
     if args.all:
         # Re-run to get intermediates
-        hand_mask, safe_mask = create_hand_segmentation_mask(gray)
-        hp = illumination_correction(gray, safe_mask)
+        hand_mask, safe_mask_dbg = create_hand_segmentation_mask(
+            gray, 
+            method=args.segmentation,
+            preprocess=args.preprocess_seg,
+            otsu_bias=args.otsu_bias,
+            canny_low=args.canny_low,
+            canny_high=args.canny_high,
+            exclude_fingers_flag=True,  # Always exclude fingers
+            finger_width=args.finger_width
+        )
+        hp = illumination_correction(gray, safe_mask_dbg)
+        
+        # Always save segmentation masks for debugging
+        cv2.imwrite(str(args.output / f"{stem}_01_hand_mask.png"), hand_mask)
+        cv2.imwrite(str(args.output / f"{stem}_02_safe_mask.png"), safe_mask_dbg)
         
         if args.use_illumination:
             # Save illumination-corrected and enhanced versions
@@ -738,15 +1387,16 @@ Examples:
         else:
             # Original pipeline intermediates
             if args.multiscale:
-                resp_u8, _ = vessel_response_multiscale(hp, safe_mask)
+                resp_dbg, _ = vessel_response_multiscale(hp, safe_mask_dbg)
             else:
-                resp_u8, _ = vessel_response_single_scale(hp, safe_mask)
+                resp_dbg, _ = vessel_response_single_scale(hp, safe_mask_dbg)
             
             cv2.imwrite(str(args.output / f"{stem}_00_original.png"), gray)
-            cv2.imwrite(str(args.output / f"{stem}_01_hand_mask.png"), hand_mask)
-            cv2.imwrite(str(args.output / f"{stem}_02_safe_mask.png"), safe_mask)
             cv2.imwrite(str(args.output / f"{stem}_03_illumination_corrected.png"), hp)
-            cv2.imwrite(str(args.output / f"{stem}_04_raw_response.png"), resp_u8)
+            cv2.imwrite(str(args.output / f"{stem}_04_raw_response.png"), resp_dbg)
+            
+            if args.enhance:
+                cv2.imwrite(str(args.output / f"{stem}_05_enhanced_feature_map.png"), enhanced)
         
         print(f"✓ Intermediate outputs saved to: {args.output}")
     
