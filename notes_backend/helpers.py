@@ -9,6 +9,10 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from functools import wraps
 from flask import request, jsonify
+import cv2
+from pathlib import Path
+import io
+import tempfile
 
 # Configuration
 DATABASE_PATH = os.path.join(os.path.dirname(__file__), 'notes_app.db')
@@ -212,3 +216,80 @@ def sanitize_input(text, max_length=10000):
         text = text[:max_length]
     
     return text
+
+
+def compute_biometric_vector_from_image(image_b64: str) -> np.ndarray:
+    """
+    Compute biometric feature vector from base64 encoded image.
+    
+    This function:
+    1. Decodes the base64 image
+    2. Reads it as grayscale
+    3. Creates hand segmentation mask
+    4. Extracts OEG feature vector using the same parameters as the CLI
+    
+    Args:
+        image_b64: Base64 encoded image string
+    
+    Returns:
+        Feature vector as numpy array (float32)
+    
+    Raises:
+        ValueError: If image decoding fails or feature extraction fails
+    """
+    try:
+        # Decode base64 image
+        image_bytes = base64.b64decode(image_b64)
+        
+        # Load image from bytes
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        
+        if img is None:
+            raise ValueError("Could not decode image from base64")
+        
+        # Import feature extraction functions from feature_map
+        # We need to add the feature_extraction module to sys.path
+        import sys
+        feature_extraction_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), 
+            'feature_extraction'
+        )
+        if feature_extraction_path not in sys.path:
+            sys.path.insert(0, feature_extraction_path)
+        
+        from feature_map import (
+            create_hand_segmentation_mask,
+            extract_oeg_feature_vector
+        )
+        
+        # Create hand segmentation mask using same parameters as CLI
+        hand_mask, safe_mask = create_hand_segmentation_mask(
+            img,
+            method="hybrid",
+            preprocess=True,
+            otsu_bias=0.85,
+            canny_low=30,
+            canny_high=100,
+            exclude_fingers_flag=True,
+            finger_width=60,
+        )
+        
+        # Extract OEG feature vector
+        vec = extract_oeg_feature_vector(
+            img,
+            safe_mask,
+            roi_size=256,
+            roi_margin=10,
+            ntheta=8,
+            grid=16,
+            ksize=31,
+            sig=5.0,
+            lambd=10.0,
+            gamma=0.5,
+        )
+        
+        return vec
+        
+    except Exception as e:
+        raise ValueError(f"Failed to compute biometric vector from image: {str(e)}")

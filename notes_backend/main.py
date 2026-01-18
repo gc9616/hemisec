@@ -56,10 +56,10 @@ def root():
         'version': '1.0.0',
         'endpoints': {
             'authentication': {
-                'POST /api/auth/signup': 'Register new user with biometric enrollment',
-                'POST /api/auth/login': 'Authenticate with password + biometric',
+                'POST /api/auth/signup': 'Register new user with biometric enrollment via image',
+                'POST /api/auth/login': 'Authenticate with password + biometric image verification',
                 'GET /api/auth/verify': 'Verify JWT token validity',
-                'PUT /api/biometric/update': 'Update biometric template'
+                'PUT /api/biometric/update': 'Update biometric template via image'
             },
             'notes': {
                 'GET /api/notes': 'Get all notes for authenticated user',
@@ -72,7 +72,11 @@ def root():
                 'GET /health': 'API health check'
             }
         },
-        'authentication': 'Bearer token required in Authorization header for protected endpoints'
+        'authentication': 'Bearer token required in Authorization header for protected endpoints',
+        'biometric': {
+            'input_format': 'Base64 encoded image file (JPEG, PNG, etc.)',
+            'processing': 'Feature vector computed on backend using palm vein feature extraction'
+        }
     }), 200
 
 

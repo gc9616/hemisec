@@ -14,13 +14,13 @@ api = Blueprint('api', __name__)
 @api.route('/auth/signup', methods=['POST'])
 def signup():
     """
-    Register a new user with password and biometric template
+    Register a new user with password and biometric enrollment via image
     
     Expected JSON:
     {
         "username": str (3-50 chars, alphanumeric + underscore),
         "password": str (min 8 chars),
-        "biometric_vector": str (base64 encoded numpy array)
+        "biometric_image": str (base64 encoded image file)
     }
     
     Returns:
@@ -32,13 +32,13 @@ def signup():
         data = request.get_json()
         
         # Validate required fields
-        valid, error = helpers.validate_input(data, ['username', 'password', 'biometric_vector'])
+        valid, error = helpers.validate_input(data, ['username', 'password', 'biometric_image'])
         if not valid:
             return jsonify({'error': error}), 400
         
         username = helpers.sanitize_input(data['username'], max_length=50)
         password = data['password']
-        biometric_vector_b64 = data['biometric_vector']
+        biometric_image_b64 = data['biometric_image']
         
         # Validate username format
         if not username.replace('_', '').isalnum() or len(username) < 3:
@@ -48,9 +48,9 @@ def signup():
         if len(password) < 8:
             return jsonify({'error': 'Password must be at least 8 characters long'}), 400
         
-        # Decode and validate biometric vector
+        # Compute biometric vector from image
         try:
-            biometric_vector = helpers.decode_biometric_vector(biometric_vector_b64)
+            biometric_vector = helpers.compute_biometric_vector_from_image(biometric_image_b64)
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
@@ -96,13 +96,13 @@ def signup():
 @api.route('/auth/login', methods=['POST'])
 def login():
     """
-    Authenticate user with password and biometric verification
+    Authenticate user with password and biometric verification via image
     
     Expected JSON:
     {
         "username": str,
         "password": str,
-        "biometric_vector": str (base64 encoded numpy array)
+        "biometric_image": str (base64 encoded image file)
     }
     
     Returns:
@@ -114,17 +114,17 @@ def login():
         data = request.get_json()
         
         # Validate required fields
-        valid, error = helpers.validate_input(data, ['username', 'password', 'biometric_vector'])
+        valid, error = helpers.validate_input(data, ['username', 'password', 'biometric_image'])
         if not valid:
             return jsonify({'error': error}), 400
         
         username = helpers.sanitize_input(data['username'])
         password = data['password']
-        biometric_vector_b64 = data['biometric_vector']
+        biometric_image_b64 = data['biometric_image']
         
-        # Decode biometric vector
+        # Compute biometric vector from image
         try:
-            provided_vector = helpers.decode_biometric_vector(biometric_vector_b64)
+            provided_vector = helpers.compute_biometric_vector_from_image(biometric_image_b64)
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
@@ -504,14 +504,14 @@ def delete_note(current_user_id, current_username, note_id):
 @helpers.token_required
 def update_biometric(current_user_id, current_username):
     """
-    Update biometric template for the authenticated user
+    Update biometric template for the authenticated user via image
     
     Headers:
         Authorization: Bearer <token>
     
     Expected JSON:
     {
-        "biometric_vector": str (base64 encoded numpy array),
+        "biometric_image": str (base64 encoded image file),
         "password": str (for verification)
     }
     
@@ -524,16 +524,16 @@ def update_biometric(current_user_id, current_username):
         data = request.get_json()
         
         # Validate required fields
-        valid, error = helpers.validate_input(data, ['biometric_vector', 'password'])
+        valid, error = helpers.validate_input(data, ['biometric_image', 'password'])
         if not valid:
             return jsonify({'error': error}), 400
         
-        biometric_vector_b64 = data['biometric_vector']
+        biometric_image_b64 = data['biometric_image']
         password = data['password']
         
-        # Decode biometric vector
+        # Compute biometric vector from image
         try:
-            biometric_vector = helpers.decode_biometric_vector(biometric_vector_b64)
+            biometric_vector = helpers.compute_biometric_vector_from_image(biometric_image_b64)
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
