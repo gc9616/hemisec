@@ -3,7 +3,8 @@
 import cv2
 import threading
 import time
-from flask import Flask, Response, jsonify
+import base64
+from flask import Flask, Response, jsonify, request
 
 # -----------------------------
 # Configuration
@@ -12,14 +13,8 @@ WIDTH = 640
 HEIGHT = 480
 FPS = 30
 
-GSTREAMER_PIPELINE = (
-    f"libcamerasrc ! "
-    f"video/x-raw,width={WIDTH},height={HEIGHT},framerate={FPS}/1 ! "
-    f"videoconvert ! appsink"
-)
-
 # -----------------------------
-# Global state
+# Global camera state
 # -----------------------------
 latest_frame = None
 frame_lock = threading.Lock()
@@ -30,17 +25,24 @@ stop_camera = False
 camera_lock = threading.Lock()
 
 # -----------------------------
-# Camera loop (single owner)
+# Camera loop
 # -----------------------------
 def camera_loop():
     global latest_frame, camera_running, stop_camera
 
-    cap = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+    # Use V4L2 device (raspicam stack)
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
     if not cap.isOpened():
         with camera_lock:
             camera_running = False
+        print("❌ Camera failed to open")
         return
 
+    print("▶ Camera started")
     while True:
         with camera_lock:
             if stop_camera:
@@ -53,73 +55,73 @@ def camera_loop():
         with frame_lock:
             latest_frame = frame.copy()
 
-        time.sleep(0.005)
+        time.sleep(1 / FPS)
 
     cap.release()
     with camera_lock:
         camera_running = False
         stop_camera = False
+    print("⏹ Camera stopped")
 
 # -----------------------------
-# Camera lifecycle helpers
+# Camera control
 # -----------------------------
 def start_camera():
-    global camera_thread, camera_running, stop_camera
-
+    global camera_thread, camera_running
     with camera_lock:
         if camera_running:
             return
-        stop_camera = False
-        camera_running = True
-
-        camera_thread = threading.Thread(
-            target=camera_loop,
-            daemon=True
-        )
+        camera_thread = threading.Thread(target=camera_loop, daemon=True)
         camera_thread.start()
+        camera_running = True
 
 def shutdown_camera():
     global stop_camera
-
     with camera_lock:
         stop_camera = True
 
 # -----------------------------
-# Flask app
+# Flask API
 # -----------------------------
 app = Flask(__name__)
 
-def mjpeg_generator():
+@app.route("/")
+def root():
+    return jsonify({
+        "message": "PalmVein Biometric Device API",
+        "version": "1.0.0",
+        "endpoints": {
+            "video_frame": "GET /video_frame -> Returns single JPEG frame for polling",
+            "capture": "POST /capture -> Returns base64 image for backend",
+        }
+    })
+
+# -----------------------------
+# Polling-friendly single frame endpoint
+# -----------------------------
+@app.route("/video_frame")
+def video_frame():
     start_camera()
 
-    try:
-        while True:
-            with frame_lock:
-                if latest_frame is None:
-                    continue
-                frame = latest_frame.copy()
+    # Wait briefly for first frame
+    timeout = time.time() + 2
+    while latest_frame is None and time.time() < timeout:
+        time.sleep(0.05)
 
-            ret, buffer = cv2.imencode(".jpg", frame)
-            if not ret:
-                continue
+    with frame_lock:
+        if latest_frame is None:
+            return jsonify({"error": "No frame available"}), 503
+        frame = latest_frame.copy()
 
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" +
-                buffer.tobytes() +
-                b"\r\n"
-            )
-    finally:
-        # Client disconnected
-        shutdown_camera()
+    ret, buffer = cv2.imencode(".jpg", frame)
+    if not ret:
+        return jsonify({"error": "Could not encode frame"}), 500
 
-@app.route("/video")
-def video():
-    return Response(
-        mjpeg_generator(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
+    return Response(buffer.tobytes(), mimetype="image/jpeg")
 
+# -----------------------------
+# Capture endpoint (returns base64)
+# -----------------------------
 @app.route("/capture", methods=["POST"])
 def capture():
     start_camera()
@@ -134,23 +136,34 @@ def capture():
             return jsonify({"error": "No frame available"}), 503
         frame = latest_frame.copy()
 
-    filename = f"/tmp/capture_{int(time.time())}.jpg"
-    cv2.imwrite(filename, frame)
+    # Encode to JPEG
+    ret, buffer = cv2.imencode(".jpg", frame)
+    if not ret:
+        return jsonify({"error": "Could not encode frame"}), 500
 
-    # Shut down camera immediately after capture
-    shutdown_camera()
+    # Encode JPEG to base64
+    image_base64 = base64.b64encode(buffer).decode("utf-8")
+
+    # Optionally shut down camera after capture
+    # Commented out if you want continuous polling
+    # shutdown_camera()
 
     return jsonify({
         "status": "ok",
-        "file": filename
+        "image_base64": image_base64
     })
+
+# -----------------------------
+# Health check
+# -----------------------------
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "camera_running": camera_running})
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    print("🟢 API running (camera OFF)")
-    print("▶ Camera starts on /video")
-    print("📸 Camera stops immediately after /capture")
-
-    app.run(host="0.0.0.0", port=8443, threaded=True)
+    print("🟢 PalmVein Pi API running")
+    print("▶ Camera will start on /video_frame or /capture")
+    app.run(host="0.0.0.0", port=8080, threaded=True)
