@@ -45,7 +45,7 @@ This repo contains:
 
 ---
 
-## Quick start (Raspberry Pi)
+## Raspberry Pi set up
 
 ### 1) Enable camera + install system deps
 On Raspberry Pi OS:
@@ -53,15 +53,7 @@ On Raspberry Pi OS:
 sudo apt update
 sudo apt install -y libcamera-apps python3 python3-venv python3-pip
 
-If OpenCV via apt is acceptable (often faster/easier on Pi):
-
-```bash
-sudo apt install -y python3-opencv
-```
-
-## 2) Create a virtual environment (recommended)
-
-Newer Pi OS images enforce PEP 668 and block system-wide pip installs.
+## 2) Create a virtual environment
 
 ```bash
 cd ~/hemisec
@@ -76,7 +68,7 @@ python -m pip install -U pip
 pip install -r requirements.txt
 ```
 
-Minimal typical deps for this project:
+deps:
 - `numpy`
 - `opencv-python` (or `python3-opencv` via apt)
 - `scikit-image` (only if you rely on it; avoid if you want speed)
@@ -91,13 +83,6 @@ Minimal typical deps for this project:
 mkdir -p palm_images
 rpicam-still -o palm_images/test.jpg --width 2592 --height 1944 --nopreview
 ```
-
-Useful flags:
-- `--width
-- `--height
-- `--nopreview
-  
----
 
 ## Flask API (Pi-side)
 
